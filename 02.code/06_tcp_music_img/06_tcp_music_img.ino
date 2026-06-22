@@ -11,12 +11,34 @@
 #include <esp_heap_caps.h>
 
 // ============================================================
-// WiFi 配置
+// 网络模式选择
 // ============================================================
-const char* ssid = "MagentaWLAN-7LSH_2.4";
-const char* password = "44573549123221016562";
+// 1 = WiFi 模式：ESP32 连接路由器，Qt 连接串口打印出来的 ESP32 IP
+// 2 = 热点模式：ESP32 自己开热点，Qt 连接 192.168.4.1
+#define NET_MODE 2
 
-// TCP 端口，要和 Qt 一致
+#if (NET_MODE != 1) && (NET_MODE != 2)
+#error "NET_MODE must be 1 (WiFi STA) or 2 (WiFi AP)"
+#endif
+
+// ============================================================
+// WiFi / 热点 配置
+// ============================================================
+// NET_MODE = 1 时使用：连接路由器
+const char* staSsid = "MagentaWLAN-7LSH_2.4";
+const char* staPassword = "44573549123221016562";
+
+// NET_MODE = 2 时使用：ESP32 自己开热点
+const char* apSsid = "ESP32_JPG_PCM";
+const char* apPassword = "12345678";   // 至少 8 位
+
+IPAddress apLocalIP(192, 168, 4, 1);
+IPAddress apGateway(192, 168, 4, 1);
+IPAddress apSubnet(255, 255, 255, 0);
+
+#define AP_CHANNEL 6
+#define AP_MAX_CONNECTIONS 1
+
 #define TCP_PORT 8081
 WiFiServer server(TCP_PORT);
 
@@ -33,8 +55,8 @@ WiFiServer server(TCP_PORT);
 #define LCD_W 240
 #define LCD_H 280
 
-// 你 Qt 发的是 280x240 横屏图，一般用 1。
-// 如果方向不对，改成 0 / 2 / 3 试。
+// Qt 发的是 280x240 横屏图片，通常用 1。
+// 方向不对就改 0 / 2 / 3。
 #define TFT_ROTATION 3
 
 #define MAX_JPG_SIZE (120 * 1024)
@@ -46,26 +68,12 @@ WiFiServer server(TCP_PORT);
 #define I2S_LRC   18
 #define I2S_DOUT  16
 
-// Qt 发送的是 16000Hz / 16bit / mono / little-endian
 #define AUDIO_SAMPLE_RATE 16000
-
-// Qt 当前 40ms 一包，大约 1280 字节。
-// 这里 4096 足够。
 #define MAX_PCM_PACKET_SIZE 4096
-
-// 不要一上来用 65536，容易把 WiFi 任务内存挤爆。
-// 32768 大约 1 秒缓存。
 #define RING_BUFFER_SIZE 32768
-
-// 先缓存多少字节再开始播放
 #define START_BUFFER_BYTES 4096
-
-// I2S 每次写多少个单声道采样点
 #define AUDIO_BLOCK_SAMPLES 512
 
-// ============================================================
-// 全局对象
-// ============================================================
 SPIClass spi = SPIClass(FSPI);
 Adafruit_ST7789 tft = Adafruit_ST7789(&spi, TFT_CS, TFT_DC, TFT_RST);
 
@@ -86,7 +94,7 @@ uint32_t underrunCount = 0;
 uint32_t overflowCount = 0;
 
 // ============================================================
-// 内存申请：优先 PSRAM，没有就用普通 RAM
+// 内存申请：优先 PSRAM，没有就普通 RAM
 // ============================================================
 uint8_t* allocBuffer(size_t size, const char *name)
 {
@@ -99,7 +107,7 @@ uint8_t* allocBuffer(size_t size, const char *name)
   }
 
   if (!p) {
-    Serial.print("ERR: malloc failed: ");
+    Serial.print("ERR malloc failed: ");
     Serial.print(name);
     Serial.print(" size=");
     Serial.println(size);
@@ -310,12 +318,23 @@ void showWaiting()
   tft.println("PCM0 audio");
 
   tft.setCursor(20, 130);
-  tft.print("IP: ");
+#if NET_MODE == 1
+  tft.print("WiFi IP: ");
   tft.println(WiFi.localIP());
+#else
+  tft.print("AP IP: ");
+  tft.println(WiFi.softAPIP());
+#endif
 
   tft.setCursor(20, 150);
   tft.print("Port: ");
   tft.println(TCP_PORT);
+
+#if NET_MODE == 2
+  tft.setCursor(20, 170);
+  tft.print("SSID: ");
+  tft.println(apSsid);
+#endif
 }
 
 bool receiveJpgPacket(WiFiClient &client, uint32_t jpgLen)
@@ -359,7 +378,7 @@ bool receiveJpgPacket(WiFiClient &client, uint32_t jpgLen)
 }
 
 // ============================================================
-// I2S / Audio
+// I2S / 音频
 // ============================================================
 void setupI2S()
 {
@@ -376,11 +395,8 @@ void setupI2S()
 #endif
 
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-
-    // 不要开太大，避免 WiFi task 申请不到内存
     .dma_buf_count = 8,
     .dma_buf_len = 512,
-
     .use_apll = false,
     .tx_desc_auto_clear = true,
     .fixed_mclk = 0
@@ -414,7 +430,6 @@ void setupI2S()
   }
 
   i2s_zero_dma_buffer(I2S_NUM_0);
-
   Serial.println("I2S ready");
 }
 
@@ -533,17 +548,19 @@ bool receiveOnePacket(WiFiClient &client)
 }
 
 // ============================================================
-// WiFi
+// WiFi / 热点
 // ============================================================
-void connectWiFi()
+void startNetwork()
 {
-  WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
 
-  Serial.print("Connecting WiFi: ");
-  Serial.println(ssid);
+#if NET_MODE == 1
+  WiFi.mode(WIFI_STA);
 
-  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi: ");
+  Serial.println(staSsid);
+
+  WiFi.begin(staSsid, staPassword);
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -551,11 +568,44 @@ void connectWiFi()
   }
 
   Serial.println();
-  Serial.println("WiFi connected");
+  Serial.println("WiFi STA connected");
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
   Serial.print("Port: ");
   Serial.println(TCP_PORT);
+
+#elif NET_MODE == 2
+  WiFi.mode(WIFI_AP);
+
+  Serial.print("Starting hotspot: ");
+  Serial.println(apSsid);
+
+  if (!WiFi.softAPConfig(apLocalIP, apGateway, apSubnet)) {
+    Serial.println("softAPConfig failed");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  bool ok = WiFi.softAP(apSsid, apPassword, AP_CHANNEL, false, AP_MAX_CONNECTIONS);
+
+  if (!ok) {
+    Serial.println("softAP start failed");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("WiFi AP started");
+  Serial.print("SSID: ");
+  Serial.println(apSsid);
+  Serial.print("Password: ");
+  Serial.println(apPassword);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("Port: ");
+  Serial.println(TCP_PORT);
+#endif
 }
 
 // ============================================================
@@ -590,8 +640,8 @@ void setup()
   TJpgDec.setSwapBytes(false);
   TJpgDec.setCallback(tft_output);
 
-  // 先启动 WiFi，再申请大内存，避免 WiFi task 创建失败
-  connectWiFi();
+  // 先启动网络，再申请大内存，避免 WiFi task 创建失败
+  startNetwork();
 
   Serial.print("Free heap before malloc: ");
   Serial.println(ESP.getFreeHeap());
@@ -653,7 +703,6 @@ void loop()
   underrunCount = 0;
   overflowCount = 0;
 
-  uint32_t pcmPacketCount = 0;
   uint32_t statTimer = millis();
 
   while (client.connected()) {
@@ -664,8 +713,6 @@ void loop()
         Serial.println("Receive packet failed, close client");
         break;
       }
-
-      pcmPacketCount++;
     } else {
       delay(1);
     }
@@ -679,7 +726,6 @@ void loop()
       Serial.print(" | Overflow: ");
       Serial.println(overflowCount);
 
-      pcmPacketCount = 0;
       statTimer = now;
     }
   }
